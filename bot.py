@@ -12,12 +12,16 @@ if not TOKEN:
 bot = telebot.TeleBot(TOKEN)
 
 # Инициализация YTMusic API
-ytmusic = YTMusic()
+ytmusic = YTMusic('headers_auth.json')  # Обязательно укажите путь к вашему headers_auth.json
 
 # Функция для поиска треков
 def search_tracks(query):
-    search_results = ytmusic.search(query, filter='songs')
-    return search_results[:5]  # Возвращаем первые 5 результатов
+    try:
+        search_results = ytmusic.search(query, filter='songs')
+        return search_results[:5]  # Возвращаем первые 5 результатов
+    except Exception as e:
+        print(f"Ошибка при поиске треков: {e}")
+        return []
 
 # Функция для получения ссылки на скачивание
 def get_download_link(video_url):
@@ -28,9 +32,16 @@ def get_download_link(video_url):
         'skip_download': True,
         'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(video_url, download=False)
-        return info['url']
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            info = ydl.extract_info(video_url, download=False)
+            if 'url' in info:
+                return info['url']
+            else:
+                return None
+    except Exception as e:
+        print(f"Ошибка при получении ссылки для скачивания: {e}")
+        return None
 
 # Обработчик команды /start
 @bot.message_handler(commands=['start'])
@@ -79,7 +90,10 @@ def send_download_link(call):
     bot.answer_callback_query(call.id, "Генерирую ссылку на скачивание...")
     try:
         download_url = get_download_link(video_url)
-        bot.send_message(call.message.chat.id, f"🔗 Ваша ссылка на скачивание:\n{download_url}")
+        if download_url:
+            bot.send_message(call.message.chat.id, f"🔗 Ваша ссылка на скачивание:\n{download_url}")
+        else:
+            bot.send_message(call.message.chat.id, "Не удалось получить ссылку для скачивания.")
     except Exception as e:
         bot.send_message(call.message.chat.id, f"Ошибка при генерации ссылки: {e}")
 

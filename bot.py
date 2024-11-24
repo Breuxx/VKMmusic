@@ -8,6 +8,7 @@ from telegram.ext import (
     Updater, CommandHandler, MessageHandler, Filters, CallbackContext
 )
 
+
 # Загрузка переменных окружения
 load_dotenv()
 

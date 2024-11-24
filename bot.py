@@ -1,101 +1,139 @@
 import os
-import telebot
-from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
-from ytmusicapi import YTMusic
-import yt_dlp
+import json
+import time
+import requests
+from dotenv import load_dotenv
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import (
+    Updater, CommandHandler, MessageHandler, Filters, CallbackContext
+)
 
-# Получение токена из переменной окружения
-TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-if not TOKEN:
-    raise ValueError("Не найден токен бота. Убедитесь, что TELEGRAM_BOT_TOKEN установлен.")
+# Загрузка переменных окружения
+load_dotenv()
 
-bot = telebot.TeleBot(TOKEN)
+TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
+VK_SERVICE_TOKEN = os.getenv("VK_SERVICE_TOKEN")
 
-# Инициализация YTMusic API
-ytmusic = YTMusic('headers_auth.json')  # Обязательно укажите путь к вашему headers_auth.json
+if not TELEGRAM_TOKEN or not VK_SERVICE_TOKEN:
+    raise ValueError("TELEGRAM_TOKEN или VK_SERVICE_TOKEN не настроены!")
 
-# Функция для поиска треков
-def search_tracks(query):
+# Кэш для запросов
+cache = {}
+user_playlists = {}
+
+# Функция для работы с VK API
+def vk_api_request(method, params):
+    """Отправка запроса к VK API с обработкой ошибок и кэшированием."""
+    base_url = "https://api.vk.com/method/"
+    params["access_token"] = VK_SERVICE_TOKEN
+    params["v"] = "5.131"
+
+    # Проверка кэша
+    cache_key = json.dumps(params)
+    if cache_key in cache:
+        return cache[cache_key]
+
     try:
-        search_results = ytmusic.search(query, filter='songs')
-        return search_results[:5]  # Возвращаем первые 5 результатов
+        response = requests.get(base_url + method, params=params).json()
+        if "error" in response:
+            raise Exception(f"Ошибка VK API: {response['error']['error_msg']}")
+        result = response.get("response", {})
+        cache[cache_key] = result  # Сохранение в кэш
+        return result
     except Exception as e:
-        print(f"Ошибка при поиске треков: {e}")
-        return []
-
-# Функция для получения ссылки на скачивание
-def get_download_link(video_url):
-    ydl_opts = {
-        'format': 'bestaudio/best',
-        'noplaylist': True,
-        'quiet': True,
-        'skip_download': True,
-        'postprocessors': [{'key': 'FFmpegExtractAudio', 'preferredcodec': 'mp3'}],
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=False)
-            if 'url' in info:
-                return info['url']
-            else:
-                return None
-    except Exception as e:
-        print(f"Ошибка при получении ссылки для скачивания: {e}")
+        print(f"Ошибка запроса к VK API: {e}")
         return None
 
-# Обработчик команды /start
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.send_message(
-        message.chat.id,
-        "Привет! Я помогу найти и скачать музыку.\n"
-        "Просто отправь название трека или исполнителя!"
+# Команда /start
+def start(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "Привет! Я могу помочь найти музыку. Отправь название трека или используй команды: "
+        "/playlist - показать твой плейлист, "
+        "/help - помощь."
     )
 
-# Обработчик текстовых сообщений (поиск музыки)
-@bot.message_handler(func=lambda message: True)
-def search_music(message):
-    query = message.text
-    bot.send_message(message.chat.id, f"Ищу музыку по запросу: {query}...")
-
-    tracks = search_tracks(query)
-
-    if not tracks:
-        bot.send_message(message.chat.id, "Ничего не найдено. Попробуйте другой запрос.")
+# Поиск музыки
+def search_music(update: Update, context: CallbackContext):
+    query = update.message.text
+    if not query:
+        update.message.reply_text("Пожалуйста, введите название трека.")
         return
 
+    # Поиск треков через VK API
+    results = vk_api_request("audio.search", {"q": query, "count": 5})
+    if not results or "items" not in results:
+        update.message.reply_text("Не удалось найти треки. Попробуйте еще раз.")
+        return
+
+    # Отправка результатов пользователю
+    tracks = results["items"]
+    keyboard = []
     for track in tracks:
-        title = track['title']
-        artist = track['artists'][0]['name']
-        video_url = f"https://www.youtube.com/watch?v={track['videoId']}"
+        title = f"{track['artist']} - {track['title']}"
+        url = track.get("url", "Ссылка недоступна")
+        update.message.reply_text(f"{title}\n{url}")
+        keyboard.append([InlineKeyboardButton(title, callback_data=track["id"])])
 
-        # Клавиатура с кнопками
-        markup = InlineKeyboardMarkup()
-        markup.add(InlineKeyboardButton("Скачать MP3", callback_data=f"download|{track['videoId']}"))
-        markup.add(InlineKeyboardButton("Открыть на YouTube", url=video_url))
+    # Добавить клавиатуру для добавления в плейлист
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    update.message.reply_text("Выберите трек для добавления в плейлист:", reply_markup=reply_markup)
 
-        bot.send_message(
-            message.chat.id,
-            f"🎵 *{title}*\n👤 {artist}",
-            parse_mode='Markdown',
-            reply_markup=markup
-        )
+# Добавление трека в плейлист
+def add_to_playlist(update: Update, context: CallbackContext):
+    query = update.callback_query
+    user_id = query.from_user.id
+    track_id = query.data
 
-# Обработчик кнопок
-@bot.callback_query_handler(func=lambda call: call.data.startswith("download|"))
-def send_download_link(call):
-    video_id = call.data.split('|')[1]
-    video_url = f"https://www.youtube.com/watch?v={video_id}"
+    # Добавляем трек в пользовательский плейлист
+    if user_id not in user_playlists:
+        user_playlists[user_id] = []
+    user_playlists[user_id].append(track_id)
 
-    bot.answer_callback_query(call.id, "Генерирую ссылку на скачивание...")
-    try:
-        download_url = get_download_link(video_url)
-        if download_url:
-            bot.send_message(call.message.chat.id, f"🔗 Ваша ссылка на скачивание:\n{download_url}")
-        else:
-            bot.send_message(call.message.chat.id, "Не удалось получить ссылку для скачивания.")
-    except Exception as e:
-        bot.send_message(call.message.chat.id, f"Ошибка при генерации ссылки: {e}")
+    query.answer("Трек добавлен в ваш плейлист!")
+    query.edit_message_text("Трек успешно добавлен в ваш плейлист.")
 
-# Запуск бота
-bot.polling(none_stop=True)
+# Команда /playlist
+def show_playlist(update: Update, context: CallbackContext):
+    user_id = update.message.from_user.id
+    playlist = user_playlists.get(user_id, [])
+
+    if not playlist:
+        update.message.reply_text("Ваш плейлист пуст. Добавьте треки с помощью поиска.")
+        return
+
+    update.message.reply_text("Ваш плейлист:")
+    for track_id in playlist:
+        update.message.reply_text(f"ID трека: {track_id}")
+
+# Команда /help
+def help_command(update: Update, context: CallbackContext):
+    update.message.reply_text(
+        "Доступные команды:\n"
+        "/start - начать работу с ботом\n"
+        "/playlist - показать ваш плейлист\n"
+        "/help - показать это сообщение\n"
+        "Или просто отправьте название трека для поиска."
+    )
+
+# Основная функция
+def main():
+    updater = Updater(TELEGRAM_TOKEN)
+    dispatcher = updater.dispatcher
+
+    # Обработчики команд
+    dispatcher.add_handler(CommandHandler("start", start))
+    dispatcher.add_handler(CommandHandler("help", help_command))
+    dispatcher.add_handler(CommandHandler("playlist", show_playlist))
+    dispatcher.add_handler(MessageHandler(Filters.text & ~Filters.command, search_music))
+
+    # Обработчик для инлайн-кнопок
+    dispatcher.add_handler(
+        CallbackQueryHandler(add_to_playlist)
+    )
+
+    # Запуск бота
+    updater.start_polling()
+    updater.idle()
+
+if __name__ == "__main__":
+    main()

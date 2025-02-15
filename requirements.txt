@@ -1,2 +1,3 @@
-pyTelegramBotAPI
-instaloader
+python-telegram-bot
+yt-dlp
+requests

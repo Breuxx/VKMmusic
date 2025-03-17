@@ -1,3 +1,185 @@
-python-telegram-bot
-yt-dlp
-requests
+//+------------------------------------------------------------------+
+//|                                               UltimateGoldEA.mq4 |
+//| Мощный робот с мультииндикаторами, адаптивным SL/TP и трейлинг-стопом |
+//|    с дополнительной адаптацией для золота (XAUUSD)                 |
+//+------------------------------------------------------------------+
+#property strict
+
+// Настройки риска и основных параметров стратегии
+extern double   RiskPercent            = 2.0;      // Риск на сделку в процентах от Equity
+extern int      ATRPeriod              = 14;       // Период ATR для оценки волатильности
+extern double   ATR_SL_Multiplier      = 1.0;      // Множитель для расчёта стоп-лосса (в ATR) по умолчанию
+extern double   ATR_TP_Multiplier      = 2.0;      // Множитель для расчёта тейк-профита (в ATR) по умолчанию
+extern int      FastMAPeriod           = 10;       // Период быстрой EMA
+extern int      SlowMAPeriod           = 50;       // Период медленной EMA
+extern int      RSIPeriod              = 14;       // Период RSI
+extern double   RSI_Overbought         = 70;       // Уровень перекупленности (фильтр для покупок)
+extern double   RSI_Oversold           = 30;       // Уровень перепроданности (фильтр для продаж)
+extern int      HigherTF               = PERIOD_H1;// Дополнительный таймфрейм для подтверждения (например, H1)
+extern int      Slippage               = 3;        // Допустимое проскальзывание
+extern int      MagicNumber            = 987654;   // Уникальный номер эксперта для идентификации ордеров
+extern int      TrailingATR_Multiplier = 1;        // Множитель ATR для расчёта трейлинг-стопа по умолчанию
+
+// Внутренние переменные для адаптации параметров при торговле золотом (XAUUSD)
+double effective_ATR_SL_Multiplier;
+double effective_ATR_TP_Multiplier;
+double effective_TrailingATR_Multiplier;
+
+//+------------------------------------------------------------------+
+//| Функция расчёта размера лота по заданному риску и дистанции SL      |
+//+------------------------------------------------------------------+
+double CalculateLotSize(double stopLossPriceDistance)
+{
+   double riskAmount = AccountEquity() * RiskPercent / 100.0;
+   double pipValue   = MarketInfo(Symbol(), MODE_TICKVALUE);
+   if(pipValue <= 0) pipValue = 1;
+   double lotSize = riskAmount / ((stopLossPriceDistance / Point) * pipValue);
+   return NormalizeDouble(lotSize, 2);
+}
+
+//+------------------------------------------------------------------+
+//| Функция проверки мультииндикаторных условий для входа в сделку     |
+//| Возвращает: 1  - сигнал на покупку                               |
+//|            -1 - сигнал на продажу                               |
+//|             0 - нет сигнала                                      |
+//+------------------------------------------------------------------+
+int CheckTradeSignal()
+{
+   // Получаем значения индикаторов на текущем таймфрейме
+   double fastMA     = iMA(NULL, 0, FastMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double slowMA     = iMA(NULL, 0, SlowMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double prevFastMA = iMA(NULL, 0, FastMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 1);
+   double prevSlowMA = iMA(NULL, 0, SlowMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 1);
+   double rsi        = iRSI(NULL, 0, RSIPeriod, PRICE_CLOSE, 0);
+   
+   // Мультифреймовый анализ – проверка EMA на HigherTF (например, H1)
+   double higherFastMA = iMA(NULL, HigherTF, FastMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
+   double higherSlowMA = iMA(NULL, HigherTF, SlowMAPeriod, 0, MODE_EMA, PRICE_CLOSE, 0);
+   
+   // Условия для входа в позицию на покупку:
+   // - Пересечение EMA: быстрая EMA пересекает медленную снизу вверх
+   // - RSI ниже уровня перекупленности
+   // - На HigherTF: быстрая EMA выше медленной (подтверждение восходящего тренда)
+   if(prevFastMA <= prevSlowMA && fastMA > slowMA && rsi < RSI_Overbought && higherFastMA > higherSlowMA)
+      return 1;
+      
+   // Условия для входа в позицию на продажу:
+   // - Пересечение EMA: быстрая EMA пересекает медленную сверху вниз
+   // - RSI выше уровня перепроданности
+   // - На HigherTF: быстрая EMA ниже медленной (подтверждение нисходящего тренда)
+   if(prevFastMA >= prevSlowMA && fastMA < slowMA && rsi > RSI_Oversold && higherFastMA < higherSlowMA)
+      return -1;
+   
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| Функция управления трейлинг-стопом с использованием ATR          |
+//+------------------------------------------------------------------+
+void ManageTrailingStop()
+{
+   for(int i = 0; i < OrdersTotal(); i++)
+   {
+      if(OrderSelect(i, SELECT_BY_POS, MODE_TRADES))
+      {
+         if(OrderMagicNumber() != MagicNumber || OrderSymbol() != Symbol())
+            continue;
+         
+         double atr = iATR(Symbol(), 0, ATRPeriod, 0);
+         double trailingDistance = atr * effective_TrailingATR_Multiplier;
+         
+         // Для позиции на покупку
+         if(OrderType() == OP_BUY)
+         {
+            double newStop = Bid - trailingDistance;
+            if(newStop > OrderStopLoss())
+            {
+               if(OrderModify(OrderTicket(), OrderOpenPrice(), newStop, OrderTakeProfit(), 0, clrGreen))
+                  Print("Trailing stop обновлён для Buy, Ticket: ", OrderTicket());
+               else
+                  Print("Ошибка обновления трейлинг-стопа для Buy, Ticket: ", OrderTicket(), " Ошибка: ", GetLastError());
+            }
+         }
+         // Для позиции на продажу
+         if(OrderType() == OP_SELL)
+         {
+            double newStop = Ask + trailingDistance;
+            if(OrderStopLoss() == 0 || newStop < OrderStopLoss())
+            {
+               if(OrderModify(OrderTicket(), OrderOpenPrice(), newStop, OrderTakeProfit(), 0, clrRed))
+                  Print("Trailing stop обновлён для Sell, Ticket: ", OrderTicket());
+               else
+                  Print("Ошибка обновления трейлинг-стопа для Sell, Ticket: ", OrderTicket(), " Ошибка: ", GetLastError());
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| Основная функция робота                                          |
+//+------------------------------------------------------------------+
+int start()
+{
+   // Адаптация параметров для золота (XAUUSD). Если символ – золото, корректируем множители.
+   effective_ATR_SL_Multiplier      = ATR_SL_Multiplier;
+   effective_ATR_TP_Multiplier      = ATR_TP_Multiplier;
+   effective_TrailingATR_Multiplier = TrailingATR_Multiplier;
+   if(StringFind(Symbol(), "XAU") != -1)
+   {
+      // Для золота можно использовать более широкий диапазон из-за высокой волатильности
+      effective_ATR_SL_Multiplier      = 1.5;
+      effective_ATR_TP_Multiplier      = 2.5;
+      effective_TrailingATR_Multiplier = 1.2;
+      Print("Применены специальные параметры для золота (", Symbol(), ")");
+   }
+   
+   // Обновляем трейлинг-стоп для открытых позиций
+   ManageTrailingStop();
+   
+   // Если нет открытых ордеров, проверяем сигнал для входа
+   if(OrdersTotal() == 0)
+   {
+      int signal = CheckTradeSignal();
+      double atr = iATR(Symbol(), 0, ATRPeriod, 0);
+      
+      // Для сигнала на покупку
+      if(signal == 1)
+      {
+         double stopLossDistance = atr * effective_ATR_SL_Multiplier;
+         double takeProfitDistance = atr * effective_ATR_TP_Multiplier;
+         double entryPrice = Ask;
+         double stopLossPrice = entryPrice - stopLossDistance;
+         double takeProfitPrice = entryPrice + takeProfitDistance;
+         
+         double lotSize = CalculateLotSize(stopLossDistance);
+         
+         int ticket = OrderSend(Symbol(), OP_BUY, lotSize, entryPrice, Slippage,
+                                stopLossPrice, takeProfitPrice, "Ultimate Gold Buy", MagicNumber, 0, clrGreen);
+         if(ticket > 0)
+            Print("Buy ордер открыт. Ticket: ", ticket, " Лот: ", lotSize);
+         else
+            Print("Ошибка открытия Buy ордера. Ошибка: ", GetLastError());
+      }
+      // Для сигнала на продажу
+      else if(signal == -1)
+      {
+         double stopLossDistance = atr * effective_ATR_SL_Multiplier;
+         double takeProfitDistance = atr * effective_ATR_TP_Multiplier;
+         double entryPrice = Bid;
+         double stopLossPrice = entryPrice + stopLossDistance;
+         double takeProfitPrice = entryPrice - takeProfitDistance;
+         
+         double lotSize = CalculateLotSize(stopLossDistance);
+         
+         int ticket = OrderSend(Symbol(), OP_SELL, lotSize, entryPrice, Slippage,
+                                stopLossPrice, takeProfitPrice, "Ultimate Gold Sell", MagicNumber, 0, clrRed);
+         if(ticket > 0)
+            Print("Sell ордер открыт. Ticket: ", ticket, " Лот: ", lotSize);
+         else
+            Print("Ошибка открытия Sell ордера. Ошибка: ", GetLastError());
+      }
+   }
+   
+   return(0);
+}
